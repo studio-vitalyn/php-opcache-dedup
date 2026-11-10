@@ -1,0 +1,34 @@
+Opcache: share identical opcode arrays between cached scripts
+
+Shared hosts commonly serve many copies of the same application (CMS
+cores, plugins, vendor directories) from a single PHP-FPM master. OPcache
+keys scripts by path, so each copy is persisted separately although most
+functions compile to exactly the same opcodes. On one production host, 80
+sites on PHP 8.4 use about 3 GB of OPcache memory while about 80% of their
+files are identical.
+
+Add opcache.enable_dedup (INI_SYSTEM, off by default). When enabled, the
+opcodes and literals of each op_array are looked up by content in a table
+kept in SHM before being persisted. If a byte-for-byte equivalent block
+exists, the new op_array points to it instead of storing a copy.
+
+- The lookup key is a position-independent serialization of the block
+  (opline-relative constant operands become literal indexes). Candidates
+  with a matching hash are always compared in full, so a hash collision
+  can never cause sharing.
+- Only opcodes and literals are shared. Each op_array keeps its own
+  filename, scope, vars, arg_info, live ranges and try/catch table.
+  __FILE__, __DIR__ and runtime definition keys are literals, so blocks
+  that depend on the path are simply not shared.
+- Scripts are still found by path, so validate_permission/validate_root
+  are unaffected and a shared block is never reachable by its hash.
+- Lookups only happen while persisting, under the SHM write lock. The
+  calc pass records its decision for each op_array and the persist pass
+  applies it, so the size is exact and each block is serialized once.
+- Nothing is freed until restart, so shared blocks need no refcount.
+  The table is cleared on restart.
+- Disabled with the JIT, which patches opline handlers, and with the
+  file cache, which cannot serialize pointers into other scripts. Only
+  available on 64-bit builds.
+
+opcache_get_status() exposes the counters in a new "dedup" key.

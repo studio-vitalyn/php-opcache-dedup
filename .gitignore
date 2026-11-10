@@ -1,0 +1,4 @@
+/build/
+*.orig
+*.rej
+local.mk

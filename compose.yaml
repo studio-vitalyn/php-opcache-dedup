@@ -1,0 +1,28 @@
+# Runs on the Docker host only:  make up  (see Makefile)
+name: opcache-dedup
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: opcache-dedup-dev
+    container_name: opcache-dedup-dev
+    hostname: opcache-dedup
+    init: true
+    # gdb attaches to FPM workers in the benchmark debug mode (GDB=1)
+    cap_add:
+      - SYS_PTRACE
+    # setarch -R (no ASLR) for ASan builds: the default seccomp profile blocks personality()
+    security_opt:
+      - seccomp:unconfined
+    # Shared host: keep the builds and the benchmark from starving neighbours
+    cpus: 10
+    mem_limit: 18g
+    volumes:
+      - ./:/repo
+      - build:/build
+    restart: "no"
+
+volumes:
+  build:

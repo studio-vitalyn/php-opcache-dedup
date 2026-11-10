@@ -1,0 +1,2098 @@
+From 9eaf5c0c73e96db715c23855806b292e17b2c0e6 Mon Sep 17 00:00:00 2001
+From: Jean-Christophe CHENAILLER <jc@vitalyn.com>
+Date: Tue, 20 Oct 2026 12:35:17 +0000
+Subject: [PATCH] Opcache: share identical opcode arrays between cached scripts
+
+Shared hosts commonly serve many copies of the same application (CMS
+cores, plugins, vendor directories) from a single PHP-FPM master. OPcache
+keys scripts by path, so each copy is persisted separately although most
+functions compile to exactly the same opcodes. On one production host, 80
+sites on PHP 8.4 use about 3 GB of OPcache memory while about 80% of their
+files are identical.
+
+Add opcache.enable_dedup (INI_SYSTEM, off by default). When enabled, the
+opcodes and literals of each op_array are looked up by content in a table
+kept in SHM before being persisted. If a byte-for-byte equivalent block
+exists, the new op_array points to it instead of storing a copy.
+
+- The lookup key is a position-independent serialization of the block
+  (opline-relative constant operands become literal indexes). Candidates
+  with a matching hash are always compared in full, so a hash collision
+  can never cause sharing.
+- Only opcodes and literals are shared. Each op_array keeps its own
+  filename, scope, vars, arg_info, live ranges and try/catch table.
+  __FILE__, __DIR__ and runtime definition keys are literals, so blocks
+  that depend on the path are simply not shared.
+- Scripts are still found by path, so validate_permission/validate_root
+  are unaffected and a shared block is never reachable by its hash.
+- Lookups only happen while persisting, under the SHM write lock. The
+  calc pass records its decision for each op_array and the persist pass
+  applies it, so the size is exact and each block is serialized once.
+- Nothing is freed until restart, so shared blocks need no refcount.
+  The table is cleared on restart.
+- Disabled with the JIT, which patches opline handlers, and with the
+  file cache, which cannot serialize pointers into other scripts. Only
+  available on 64-bit builds.
+
+opcache_get_status() exposes the counters in a new "dedup" key.
+---
+ ext/opcache/ZendAccelerator.c                 |   2 +
+ ext/opcache/ZendAccelerator.h                 |   3 +
+ ext/opcache/config.m4                         |   1 +
+ ext/opcache/config.w32                        |   1 +
+ ext/opcache/tests/dedup/dedup.inc             |  38 ++
+ ext/opcache/tests/dedup/dedup_basic.phpt      |  60 ++
+ ext/opcache/tests/dedup/dedup_classes.phpt    |  95 +++
+ .../tests/dedup/dedup_cotenant_write.phpt     |  81 +++
+ ext/opcache/tests/dedup/dedup_disabled.phpt   |  23 +
+ ext/opcache/tests/dedup/dedup_file_cache.phpt |  21 +
+ .../tests/dedup/dedup_hash_collision.phpt     |  60 ++
+ ext/opcache/tests/dedup/dedup_hostile.phpt    |  79 +++
+ ext/opcache/tests/dedup/dedup_invalidate.phpt |  51 ++
+ ext/opcache/tests/dedup/dedup_jit.phpt        |  25 +
+ ext/opcache/tests/dedup/dedup_literals.phpt   |  55 ++
+ ext/opcache/tests/dedup/dedup_paths.phpt      |  88 +++
+ .../tests/dedup/dedup_protect_memory.phpt     |  46 ++
+ .../tests/dedup/dedup_shared_values.phpt      |  72 +++
+ ext/opcache/tests/dedup/dedup_variants.phpt   |  91 +++
+ ext/opcache/tests/dedup/dedup_vendored.phpt   |  77 +++
+ ext/opcache/zend_accelerator_dedup.c          | 612 ++++++++++++++++++
+ ext/opcache/zend_accelerator_dedup.h          |  83 +++
+ ext/opcache/zend_accelerator_module.c         |   4 +
+ ext/opcache/zend_persist.c                    |  25 +-
+ ext/opcache/zend_persist_calc.c               |  14 +-
+ php.ini-development                           |   7 +
+ php.ini-production                            |   7 +
+ 27 files changed, 1717 insertions(+), 4 deletions(-)
+ create mode 100644 ext/opcache/tests/dedup/dedup.inc
+ create mode 100644 ext/opcache/tests/dedup/dedup_basic.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_classes.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_cotenant_write.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_disabled.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_file_cache.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_hash_collision.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_hostile.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_invalidate.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_jit.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_literals.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_paths.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_protect_memory.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_shared_values.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_variants.phpt
+ create mode 100644 ext/opcache/tests/dedup/dedup_vendored.phpt
+ create mode 100644 ext/opcache/zend_accelerator_dedup.c
+ create mode 100644 ext/opcache/zend_accelerator_dedup.h
+
+diff --git a/ext/opcache/ZendAccelerator.c b/ext/opcache/ZendAccelerator.c
+index 1afcff2d..c5a13a72 100644
+--- a/ext/opcache/ZendAccelerator.c
++++ b/ext/opcache/ZendAccelerator.c
+@@ -2708,6 +2708,7 @@ zend_result accel_activate(INIT_FUNC_ARGS)
+ 				zend_map_ptr_reset();
+ 				zend_reset_cache_vars();
+ 				zend_accel_hash_clean(&ZCSG(hash));
++				zend_accel_dedup_reset();
+ 
+ 				if (ZCG(accel_directives).interned_strings_buffer) {
+ 					accel_interned_strings_restore_state();
+@@ -2882,6 +2883,7 @@ static int zend_accel_init_shm(void)
+ 	ZSMMG(app_shared_globals) = accel_shared_globals;
+ 
+ 	zend_accel_hash_init(&ZCSG(hash), ZCG(accel_directives).max_accelerated_files);
++	zend_accel_dedup_init_shm();
+ 
+ 	if (ZCG(accel_directives).interned_strings_buffer) {
+ 		uint32_t hash_size;
+diff --git a/ext/opcache/ZendAccelerator.h b/ext/opcache/ZendAccelerator.h
+index bc92854c..27decc09 100644
+--- a/ext/opcache/ZendAccelerator.h
++++ b/ext/opcache/ZendAccelerator.h
+@@ -54,6 +54,7 @@
+ #include "Optimizer/zend_optimizer.h"
+ #include "zend_accelerator_hash.h"
+ #include "zend_accelerator_debug.h"
++#include "zend_accelerator_dedup.h"
+ 
+ #ifndef PHPAPI
+ # ifdef ZEND_WIN32
+@@ -160,6 +161,7 @@ typedef struct _zend_accel_directives {
+ 	bool      protect_memory;
+ 	bool      file_override_enabled;
+ 	bool      enable_cli;
++	bool      enable_dedup;
+ 	bool      validate_permission;
+ #ifndef ZEND_WIN32
+ 	bool      validate_root;
+@@ -250,6 +252,7 @@ typedef struct _zend_accel_shared_globals {
+ 	zend_ulong   hash_restarts;    /* number of restarts because of hash overflow */
+ 	zend_ulong   manual_restarts;  /* number of restarts scheduled by opcache_reset() */
+ 	zend_accel_hash hash;             /* hash table for cached scripts */
++	zend_accel_dedup_table *dedup;    /* shared opcode blocks, see zend_accelerator_dedup.h */
+ 
+ 	size_t map_ptr_last;
+ 
+diff --git a/ext/opcache/config.m4 b/ext/opcache/config.m4
+index b3929382..b041f48e 100644
+--- a/ext/opcache/config.m4
++++ b/ext/opcache/config.m4
+@@ -325,6 +325,7 @@ int main(void) {
+ 	ZendAccelerator.c \
+ 	zend_accelerator_blacklist.c \
+ 	zend_accelerator_debug.c \
++	zend_accelerator_dedup.c \
+ 	zend_accelerator_hash.c \
+ 	zend_accelerator_module.c \
+ 	zend_persist.c \
+diff --git a/ext/opcache/config.w32 b/ext/opcache/config.w32
+index 764a2eda..7beb978c 100644
+--- a/ext/opcache/config.w32
++++ b/ext/opcache/config.w32
+@@ -9,6 +9,7 @@ if (PHP_OPCACHE != "no") {
+ 		ZendAccelerator.c \
+ 		zend_accelerator_blacklist.c \
+ 		zend_accelerator_debug.c \
++		zend_accelerator_dedup.c \
+ 		zend_accelerator_hash.c \
+ 		zend_accelerator_module.c \
+ 		zend_accelerator_util_funcs.c \
+diff --git a/ext/opcache/tests/dedup/dedup.inc b/ext/opcache/tests/dedup/dedup.inc
+new file mode 100644
+index 00000000..b31b9f24
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup.inc
+@@ -0,0 +1,38 @@
++<?php
++
++/* Writes $code to <tests/dedup>/<$name>/<$site>/<$file> for each site and
++ * returns the absolute paths, keyed by site. */
++function dedup_make_sites(string $name, string $code, array $sites = ['a', 'b'], string $file = 'lib.php'): array
++{
++    $paths = [];
++    foreach ($sites as $site) {
++        $dir = __DIR__ . "/$name/$site";
++        if (!is_dir($dir)) {
++            mkdir($dir, 0777, true);
++        }
++        file_put_contents("$dir/$file", $code);
++        $paths[$site] = "$dir/$file";
++    }
++    return $paths;
++}
++
++function dedup_remove_sites(string $name): void
++{
++    $base = __DIR__ . "/$name";
++    if (!is_dir($base)) {
++        return;
++    }
++    $it = new RecursiveIteratorIterator(
++        new RecursiveDirectoryIterator($base, FilesystemIterator::SKIP_DOTS),
++        RecursiveIteratorIterator::CHILD_FIRST
++    );
++    foreach ($it as $entry) {
++        $entry->isDir() ? rmdir($entry->getPathname()) : unlink($entry->getPathname());
++    }
++    rmdir($base);
++}
++
++function dedup_stats(): array
++{
++    return opcache_get_status(false)['dedup'];
++}
+diff --git a/ext/opcache/tests/dedup/dedup_basic.phpt b/ext/opcache/tests/dedup/dedup_basic.phpt
+new file mode 100644
+index 00000000..52d66844
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_basic.phpt
+@@ -0,0 +1,60 @@
++--TEST--
++opcache.enable_dedup: identical files at different paths share their opcodes
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++$paths = dedup_make_sites('dedup_basic', <<<'PHP'
++<?php
++/* Declared at runtime, so that both copies can be compiled in one process */
++if (!function_exists('dedup_basic_sum')) {
++    function dedup_basic_sum(array $values): int
++    {
++        $sum = 0;
++        foreach ($values as $value) {
++            $sum += $value;
++        }
++        return $sum;
++    }
++}
++PHP);
++
++var_dump(dedup_stats()['enabled']);
++var_dump(opcache_compile_file($paths['a']));
++$before = dedup_stats();
++var_dump(opcache_compile_file($paths['b']));
++$after = dedup_stats();
++
++/* The function is shared. The main script is too, except on PHP 8.0 where
++ * it holds the path-dependent runtime definition key of the function. */
++var_dump($after['hits'] - $before['hits'] >= 1);
++var_dump($after['hits'] + $after['misses'] - $before['hits'] - $before['misses']);
++var_dump($after['saved_memory'] > $before['saved_memory']);
++var_dump(opcache_is_script_cached($paths['a']), opcache_is_script_cached($paths['b']));
++
++include $paths['b'];
++var_dump(dedup_basic_sum([1, 2, 3]));
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_basic');
++?>
++--EXPECT--
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++int(2)
++bool(true)
++bool(true)
++bool(true)
++int(6)
+diff --git a/ext/opcache/tests/dedup/dedup_classes.phpt b/ext/opcache/tests/dedup/dedup_classes.phpt
+new file mode 100644
+index 00000000..01a82199
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_classes.phpt
+@@ -0,0 +1,95 @@
++--TEST--
++opcache.enable_dedup: classes, inheritance, traits and static variables
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++$paths = dedup_make_sites('dedup_classes', <<<'PHP'
++<?php
++namespace DedupClasses;
++
++/* Declared at runtime, so that both copies can be compiled in one process */
++if (!trait_exists(Counts::class, false)) {
++    trait Counts
++    {
++        public function next(): int
++        {
++            static $calls = 0;
++            return ++$calls;
++        }
++    }
++
++    abstract class Shape
++    {
++        public const UNIT = 'cm';
++
++        abstract public function area(): float;
++
++        public function describe(): string
++        {
++            return sprintf('%s: %.2f %s2', static::class, $this->area(), self::UNIT);
++        }
++    }
++
++    final class Square extends Shape
++    {
++        use Counts;
++
++        public function __construct(private float $side) {}
++
++        public function area(): float
++        {
++            return $this->side ** 2;
++        }
++    }
++
++    final class Circle extends Shape
++    {
++        use Counts;
++
++        public function __construct(private float $radius) {}
++
++        public function area(): float
++        {
++            return M_PI * $this->radius ** 2;
++        }
++    }
++}
++PHP);
++
++var_dump(opcache_compile_file($paths['a']));
++$before = dedup_stats();
++var_dump(opcache_compile_file($paths['b']));
++$after = dedup_stats();
++var_dump($after['hits'] - $before['hits'] >= 5);
++
++include $paths['b'];
++$square = new DedupClasses\Square(3);
++$circle = new DedupClasses\Circle(1);
++echo $square->describe(), "\n", $circle->describe(), "\n";
++var_dump($square->next(), $square->next(), $circle->next());
++var_dump((new ReflectionMethod($square, 'describe'))->getFileName() === $paths['b']);
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_classes');
++?>
++--EXPECT--
++bool(true)
++bool(true)
++bool(true)
++DedupClasses\Square: 9.00 cm2
++DedupClasses\Circle: 3.14 cm2
++int(1)
++int(2)
++int(1)
++bool(true)
+diff --git a/ext/opcache/tests/dedup/dedup_cotenant_write.phpt b/ext/opcache/tests/dedup/dedup_cotenant_write.phpt
+new file mode 100644
+index 00000000..ecf711e0
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_cotenant_write.phpt
+@@ -0,0 +1,81 @@
++--TEST--
++opcache.enable_dedup: a tenant sharing a block cannot mutate it for the others
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++/* A and B have byte-identical code, so their op_array points at the same
++ * shared opcodes and the same shared literal (a constant array). A then does
++ * everything a hostile co-tenant can do from PHP to that block: mutate what
++ * the shared literal returns, feed it to functions, write to it by reference.
++ * B, and the shared memory, must be unaffected. There is no PHP API that
++ * writes opcodes or the persisted literal zvals; both are immutable in SHM. */
++$code = <<<'PHP'
++<?php
++return new class {
++    public function config(): array
++    {
++        return ['db' => ['user' => 'root', 'pass' => 'secret'], 'keys' => [1, 2, 3]];
++    }
++    public function run(string $s): string
++    {
++        return strtoupper($s);
++    }
++};
++PHP;
++$paths = dedup_make_sites('dedup_cotenant', $code);
++
++$before = dedup_stats();
++$a = include $paths['a'];
++$b = include $paths['b'];
++$shared = dedup_stats()['hits'] - $before['hits'];
++var_dump($shared >= 2);               /* config() and run() shared */
++
++/* A mutates every value it can reach from the shared literal */
++$cfg = $a->config();
++$cfg['db']['pass'] = 'OWNED';
++$cfg['keys'][] = 99;
++sort($cfg['keys']);
++$ref = &$cfg['db'];
++$ref['injected'] = true;
++unset($ref);
++$a->run('x');                          /* exercise the shared opcodes */
++
++/* B must still see the pristine constant, proving the shared literal was
++ * copied on write, never mutated in place */
++$bc = $b->config();
++var_dump($bc['db']['pass']);
++var_dump(array_key_exists('injected', $bc['db']));
++var_dump($bc['keys']);
++var_dump($b->run('abc'));
++
++/* A re-reads its own constant: also pristine (copy-on-write, not the mutated $cfg) */
++var_dump($a->config()['db']['pass']);
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_cotenant');
++?>
++--EXPECT--
++bool(true)
++string(6) "secret"
++bool(false)
++array(3) {
++  [0]=>
++  int(1)
++  [1]=>
++  int(2)
++  [2]=>
++  int(3)
++}
++string(3) "ABC"
++string(6) "secret"
+diff --git a/ext/opcache/tests/dedup/dedup_disabled.phpt b/ext/opcache/tests/dedup/dedup_disabled.phpt
+new file mode 100644
+index 00000000..3c5b2556
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_disabled.phpt
+@@ -0,0 +1,23 @@
++--TEST--
++opcache.enable_dedup is off by default
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.file_update_protection=0
++--FILE--
++<?php
++var_dump(opcache_get_status(false)['dedup']);
++var_dump(opcache_get_configuration()['directives']['opcache.enable_dedup']);
++var_dump(ini_get('opcache.enable_dedup'));
++var_dump(ini_set('opcache.enable_dedup', '1'));
++?>
++--EXPECT--
++array(1) {
++  ["enabled"]=>
++  bool(false)
++}
++bool(false)
++string(1) "0"
++bool(false)
+diff --git a/ext/opcache/tests/dedup/dedup_file_cache.phpt b/ext/opcache/tests/dedup/dedup_file_cache.phpt
+new file mode 100644
+index 00000000..0ca040c7
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_file_cache.phpt
+@@ -0,0 +1,21 @@
++--TEST--
++opcache.enable_dedup is ignored when opcache.file_cache is set
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_cache={TMP}
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++var_dump(opcache_get_status(false)['dedup']);
++var_dump(opcache_get_configuration()['directives']['opcache.enable_dedup']);
++?>
++--EXPECT--
++array(1) {
++  ["enabled"]=>
++  bool(false)
++}
++bool(true)
+diff --git a/ext/opcache/tests/dedup/dedup_hash_collision.phpt b/ext/opcache/tests/dedup/dedup_hash_collision.phpt
+new file mode 100644
+index 00000000..08e443dd
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_hash_collision.phpt
+@@ -0,0 +1,60 @@
++--TEST--
++opcache.enable_dedup: blocks whose keys collide are compared in full, never shared
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++/* The table is keyed with zend_hash_func(), which is not collision
++ * resistant: "Ab" and "BA" hash alike, and so does any string made of such
++ * pairs. Identical opcodes with these literals give identical keys. Only a
++ * full comparison may decide, so every copy must keep its own value. */
++$pairs = [['Ab', 'BA'], ['Ab', 'BA'], ['Ab', 'BA']];
++$sites = [];
++for ($i = 0; $i < 8; $i++) {
++    $literal = '';
++    foreach ($pairs as $bit => $pair) {
++        $literal .= $pair[($i >> $bit) & 1];
++    }
++    $sites["s$i"] = $literal;
++}
++
++$paths = [];
++foreach ($sites as $site => $literal) {
++    /* __FILE__ keeps the (otherwise identical) main scripts out of the count */
++    $paths[$site] = dedup_make_sites('dedup_hash_collision', "<?php\n\$f = __FILE__;\nreturn static fn () => '$literal';\n", [$site])[$site];
++}
++
++$before = dedup_stats();
++foreach ($paths as $site => $path) {
++    $fn = include $path;
++    var_dump($fn() === $sites[$site]);
++}
++$after = dedup_stats();
++var_dump($after['hits'] - $before['hits']);
++/* Each colliding block got its own slot */
++var_dump($after['num_entries'] - $before['num_entries'] >= 8);
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_hash_collision');
++?>
++--EXPECT--
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++int(0)
++bool(true)
+diff --git a/ext/opcache/tests/dedup/dedup_hostile.phpt b/ext/opcache/tests/dedup/dedup_hostile.phpt
+new file mode 100644
+index 00000000..04f69d40
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_hostile.phpt
+@@ -0,0 +1,79 @@
++--TEST--
++opcache.enable_dedup: pathological code (deep literals, huge functions, full table)
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++opcache.max_accelerated_files=200
++opcache.memory_consumption=256
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++/* A constant array nested 200 deep: beyond the serializer's limit, the
++ * op_array is simply not shared, and its value is intact. */
++$deep = str_repeat('[', 200) . '1' . str_repeat(']', 200);
++$paths = dedup_make_sites('dedup_hostile', "<?php\n\$f = __FILE__;\nreturn static fn () => $deep;\n");
++$a = include $paths['a'];
++$before = dedup_stats();
++$b = include $paths['b'];
++$after = dedup_stats();
++$v = $b();
++for ($i = 0; $i < 200; $i++) { $v = $v[0]; }
++var_dump($v, $after['hits'] - $before['hits']);
++
++/* 60 000 literals and 60 000 opcodes in one function, twice */
++$code = "<?php\nif (!function_exists('big_fn')) {\nfunction big_fn() {\n\$s = 0;\n" . implode("\n", array_map(fn ($i) => "\$s += $i * 3;", range(1, 60000))) . "\nreturn \$s;\n}\n}\nreturn static fn () => big_fn();\n";
++$paths = dedup_make_sites('dedup_hostile_big', $code);
++var_dump(opcache_compile_file($paths['a']));
++$before = dedup_stats();
++var_dump(opcache_compile_file($paths['b']));
++$after = dedup_stats();
++var_dump($after['hits'] - $before['hits'] >= 1);
++
++/* max_accelerated_files=200 gives a 1024-slot table, 768 entries at most:
++ * 900 distinct functions fill it, later ones are not registered, nothing
++ * else changes */
++$code = "<?php\n" . implode("\n", array_map(fn ($i) => "function fill_$i() { return $i; }", range(1, 900))) . "\nreturn fill_900();\n";
++$paths = dedup_make_sites('dedup_hostile_fill', $code, ['a']);
++var_dump(include $paths['a']);
++$s = dedup_stats();
++var_dump($s['num_entries'] === $s['max_entries']);
++$paths = dedup_make_sites('dedup_hostile_after', "<?php\nreturn static fn () => 'still works';\n", ['a', 'b']);
++$a = include $paths['a'];
++$b = include $paths['b'];
++var_dump($b(), dedup_stats()['num_entries'] === $s['max_entries']);
++
++/* opcache_reset() schedules a restart for the next request: in this one,
++ * the table is still full and still consistent. The restart itself is
++ * covered by the FPM isolation checks. */
++var_dump(opcache_reset());
++$paths = dedup_make_sites('dedup_hostile_reset', "<?php\n\$f = __FILE__;\nreturn static fn () => 'after reset';\n", ['a', 'b']);
++$a = include $paths['a'];
++$b = include $paths['b'];
++var_dump($b(), dedup_stats()['num_entries'] === $s['max_entries']);
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++foreach (['dedup_hostile', 'dedup_hostile_big', 'dedup_hostile_fill', 'dedup_hostile_after', 'dedup_hostile_reset'] as $d) {
++    dedup_remove_sites($d);
++}
++?>
++--EXPECT--
++int(1)
++int(0)
++bool(true)
++bool(true)
++bool(true)
++int(900)
++bool(true)
++string(11) "still works"
++bool(true)
++bool(true)
++string(11) "after reset"
++bool(true)
+diff --git a/ext/opcache/tests/dedup/dedup_invalidate.phpt b/ext/opcache/tests/dedup/dedup_invalidate.phpt
+new file mode 100644
+index 00000000..66b6dc94
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_invalidate.phpt
+@@ -0,0 +1,51 @@
++--TEST--
++opcache.enable_dedup: unchanged functions are shared again after a file is updated
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++opcache.validate_timestamps=1
++opcache.revalidate_freq=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++$v1 = <<<'PHP'
++<?php
++return [
++    'greet' => static fn (string $name): string => "Hello, $name!",
++    'version' => static fn (): int => 1,
++];
++PHP;
++$v2 = str_replace('=> 1,', '=> 2,', $v1);
++
++$paths = dedup_make_sites('dedup_invalidate', $v1, ['a']);
++$lib = include $paths['a'];
++echo $lib['greet']('a'), ' v', $lib['version'](), "\n";
++
++file_put_contents($paths['a'], $v2);
++touch($paths['a'], time() + 10);
++clearstatcache();
++var_dump(opcache_invalidate($paths['a'], true));
++
++$before = dedup_stats();
++$lib = include $paths['a'];
++$after = dedup_stats();
++echo $lib['greet']('a'), ' v', $lib['version'](), "\n";
++/* "greet" is unchanged and shared with the stale copy */
++var_dump($after['hits'] > $before['hits']);
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_invalidate');
++?>
++--EXPECT--
++Hello, a! v1
++bool(true)
++Hello, a! v2
++bool(true)
+diff --git a/ext/opcache/tests/dedup/dedup_jit.phpt b/ext/opcache/tests/dedup/dedup_jit.phpt
+new file mode 100644
+index 00000000..084a73f4
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_jit.phpt
+@@ -0,0 +1,25 @@
++--TEST--
++opcache.enable_dedup is ignored when the JIT is enabled
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.jit=tracing
++opcache.jit_buffer_size=16M
++--SKIPIF--
++<?php
++if (!isset(opcache_get_configuration()['directives']['opcache.jit'])) {
++    die('skip JIT not compiled in');
++}
++?>
++--FILE--
++<?php
++$status = opcache_get_status(false);
++var_dump($status['jit']['enabled']);
++var_dump($status['dedup']['enabled']);
++?>
++--EXPECT--
++bool(true)
++bool(false)
+diff --git a/ext/opcache/tests/dedup/dedup_literals.phpt b/ext/opcache/tests/dedup/dedup_literals.phpt
+new file mode 100644
+index 00000000..684d9a13
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_literals.phpt
+@@ -0,0 +1,55 @@
++--TEST--
++opcache.enable_dedup: blocks differing only in literal values are not shared
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++$template = <<<'PHP'
++<?php
++$file = __FILE__; /* keeps the main script out of the comparison */
++return static function () {
++    return [STR, INT, FLOAT, ARR];
++};
++PHP;
++$variants = [
++    'a' => ['"abc"', '1', '0.0', "['x' => 1, 'y' => [2]]"],
++    'b' => ['"abd"', '1', '0.0', "['x' => 1, 'y' => [2]]"],
++    'c' => ['"abc"', '2', '0.0', "['x' => 1, 'y' => [2]]"],
++    'd' => ['"abc"', '1', '-0.0', "['x' => 1, 'y' => [2]]"],
++    'e' => ['"abc"', '1', '0.0', "['y' => [2], 'x' => 1]"],
++    'f' => ['"abc"', '1', '0.0', "['x' => 1, 'y' => ['2']]"],
++    'g' => ['"abc"', '1', '0.0', "['x' => 1, 'y' => [2]]"], /* same as a */
++];
++
++$closures = [];
++foreach ($variants as $site => [$str, $int, $float, $arr]) {
++    $code = str_replace(['STR', 'INT', 'FLOAT', 'ARR'], [$str, $int, $float, $arr], $template);
++    $path = dedup_make_sites('dedup_literals', $code, [$site])[$site];
++    $before = dedup_stats();
++    $closures[$site] = include $path;
++    $after = dedup_stats();
++    echo $site, ': ', json_encode($closures[$site](), JSON_PRESERVE_ZERO_FRACTION), ' ',
++        $after['hits'] > $before['hits'] ? 'shared' : 'stored', "\n";
++}
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_literals');
++?>
++--EXPECT--
++a: ["abc",1,0.0,{"x":1,"y":[2]}] stored
++b: ["abd",1,0.0,{"x":1,"y":[2]}] stored
++c: ["abc",2,0.0,{"x":1,"y":[2]}] stored
++d: ["abc",1,-0.0,{"x":1,"y":[2]}] stored
++e: ["abc",1,0.0,{"y":[2],"x":1}] stored
++f: ["abc",1,0.0,{"x":1,"y":["2"]}] stored
++g: ["abc",1,0.0,{"x":1,"y":[2]}] shared
+diff --git a/ext/opcache/tests/dedup/dedup_paths.phpt b/ext/opcache/tests/dedup/dedup_paths.phpt
+new file mode 100644
+index 00000000..b75c92b9
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_paths.phpt
+@@ -0,0 +1,88 @@
++--TEST--
++opcache.enable_dedup: __FILE__, __DIR__, exceptions and reflection stay per path
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++$paths = dedup_make_sites('dedup_paths', <<<'PHP'
++<?php
++return [
++    'file' => __FILE__,
++    'dir' => __DIR__,
++    'classify' => static function (int|string $value): string {
++        $kind = match (true) {
++            is_int($value) && $value < 0 => 'negative',
++            is_int($value) => 'positive',
++            default => 'string',
++        };
++        switch ($value) {
++            case 'alpha': return "$kind:first";
++            case 'beta': return "$kind:second";
++            case 'gamma': return "$kind:third";
++        }
++        return "$kind:other";
++    },
++    'thrower' => static function (): void {
++        throw new RuntimeException('boom');
++    },
++    'where' => static function (): string {
++        return __FILE__;
++    },
++];
++PHP);
++
++$before = dedup_stats();
++$a = include $paths['a'];
++$b = include $paths['b'];
++$after = dedup_stats();
++
++var_dump($a['file'] === $paths['a'], $b['file'] === $paths['b']);
++var_dump($a['dir'] === dirname($paths['a']), $b['dir'] === dirname($paths['b']));
++var_dump($a['where']() === $paths['a'], $b['where']() === $paths['b']);
++var_dump($a['classify']('beta'), $b['classify'](-3), $b['classify']('zeta'));
++
++foreach (['a' => $a, 'b' => $b] as $site => $lib) {
++    try {
++        $lib['thrower']();
++    } catch (RuntimeException $e) {
++        var_dump($e->getFile() === $paths[$site], $e->getLine());
++        var_dump($e->getTrace()[0]['file'] === __FILE__);
++    }
++    var_dump((new ReflectionFunction($lib['thrower']))->getFileName() === $paths[$site]);
++}
++
++/* "classify" and "thrower" are shared, "where" and the main script are not */
++var_dump($after['hits'] - $before['hits'] >= 2);
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_paths');
++?>
++--EXPECT--
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++string(13) "string:second"
++string(14) "negative:other"
++string(12) "string:other"
++bool(true)
++int(19)
++bool(true)
++bool(true)
++bool(true)
++int(19)
++bool(true)
++bool(true)
++bool(true)
+diff --git a/ext/opcache/tests/dedup/dedup_protect_memory.phpt b/ext/opcache/tests/dedup/dedup_protect_memory.phpt
+new file mode 100644
+index 00000000..7d318ee1
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_protect_memory.phpt
+@@ -0,0 +1,46 @@
++--TEST--
++opcache.enable_dedup: shared blocks are never written at runtime
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++opcache.protect_memory=1
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++$paths = dedup_make_sites('dedup_protect_memory', <<<'PHP'
++<?php
++return static function (array $words): array {
++    $out = [];
++    foreach ($words as $i => $word) {
++        $out[] = match ($i % 3) {
++            0 => strtoupper($word),
++            1 => strrev($word),
++            default => str_repeat($word, 2),
++        };
++    }
++    return $out;
++};
++PHP, ['a', 'b', 'c']);
++
++foreach ($paths as $path) {
++    $fn = include $path;
++    echo implode(',', $fn(['foo', 'bar', 'baz', 'qux'])), "\n";
++}
++var_dump(dedup_stats()['hits'] >= 2);
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_protect_memory');
++?>
++--EXPECT--
++FOO,rab,bazbaz,QUX
++FOO,rab,bazbaz,QUX
++FOO,rab,bazbaz,QUX
++bool(true)
+diff --git a/ext/opcache/tests/dedup/dedup_shared_values.phpt b/ext/opcache/tests/dedup/dedup_shared_values.phpt
+new file mode 100644
+index 00000000..d2dd421a
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_shared_values.phpt
+@@ -0,0 +1,72 @@
++--TEST--
++opcache.enable_dedup: array literals shared by several op_arrays of a script
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++/* The optimizer substitutes self::MAP into the methods, so the same nested
++ * arrays end up in the literals of several op_arrays and in the constant
++ * table. The first of them to be persisted moves them to SHM; the others,
++ * shared or not, must follow the xlat table instead of the freed copy. */
++$paths = dedup_make_sites('dedup_shared_values', <<<'PHP'
++<?php
++namespace DedupSharedValues;
++
++if (!class_exists(Registry::class, false)) {
++    final class Registry
++    {
++        public const MAP = ['colors' => ['red' => 1, 'green' => 2], 'sizes' => ['s', 'm', 'l']];
++
++        public function all(): array
++        {
++            return self::MAP;
++        }
++
++        public function colors(): array
++        {
++            return self::MAP['colors'];
++        }
++
++        public function sizes(): array
++        {
++            return self::MAP['sizes'];
++        }
++
++        public function nested(): array
++        {
++            return ['map' => self::MAP, 'colors' => self::MAP['colors']];
++        }
++    }
++}
++PHP, ['a', 'b', 'c']);
++
++$before = dedup_stats();
++foreach ($paths as $path) {
++    var_dump(opcache_compile_file($path));
++}
++$after = dedup_stats();
++var_dump($after['hits'] - $before['hits'] >= 8);
++
++include $paths['c'];
++$registry = new DedupSharedValues\Registry();
++echo json_encode([$registry->all(), $registry->colors(), $registry->sizes(), $registry->nested()]), "\n";
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_shared_values');
++?>
++--EXPECT--
++bool(true)
++bool(true)
++bool(true)
++bool(true)
++[{"colors":{"red":1,"green":2},"sizes":["s","m","l"]},{"red":1,"green":2},["s","m","l"],{"map":{"colors":{"red":1,"green":2},"sizes":["s","m","l"]},"colors":{"red":1,"green":2}}]
+diff --git a/ext/opcache/tests/dedup/dedup_variants.phpt b/ext/opcache/tests/dedup/dedup_variants.phpt
+new file mode 100644
+index 00000000..1b30c50f
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_variants.phpt
+@@ -0,0 +1,91 @@
++--TEST--
++opcache.enable_dedup: two docroots with the same layout, where some functions differ
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++/* name => [code in docroot a, code in docroot b, arguments] */
++$variants = [
++    /* one difference: never shared, each copy keeps its own behaviour */
++    'operator'   => ['fn ($a, $b) => $a + $b', 'fn ($a, $b) => $a - $b', [5, 3]],
++    'comparison' => ['fn ($a) => $a < 3 ? "lt" : "ge"', 'fn ($a) => $a <= 3 ? "lt" : "ge"', [3]],
++    'int'        => ['fn () => 10', 'fn () => 11', []],
++    'string'     => ['fn () => "abc"', 'fn () => "abd"', []],
++    'float'      => ['fn () => 0.1 + 0.2', 'fn () => 0.1 + 0.3', []],
++    'branches'   => ['function ($x) { if ($x) { return "yes"; } return "no"; }', 'function ($x) { if ($x) { return "no"; } return "yes"; }', [true]],
++    'call'       => ['fn ($s) => strtoupper($s)', 'fn ($s) => strtolower($s)', ['MiXeD']],
++    'arg_order'  => ['fn ($a, $b) => $a . $b', 'fn ($a, $b) => $b . $a', ['x', 'y']],
++    'statement'  => ['function ($a) { $a *= 2; return $a; }', 'function ($a) { $a *= 2; $a++; return $a; }', [4]],
++    'default'    => ['fn ($a = 1) => $a', 'fn ($a = 2) => $a', []],
++    'array'      => ['fn () => json_encode(["x" => 1, "y" => 2])', 'fn () => json_encode(["y" => 2, "x" => 1])', []],
++    'match'      => ['fn ($v) => match ($v) { 1 => "one", 2 => "two", default => "other" }', 'fn ($v) => match ($v) { 1 => "one", 2 => "deux", default => "other" }', [2]],
++    'switch'     => ['function ($s) { switch ($s) { case "a": return 1; case "b": return 2; } return 0; }', 'function ($s) { switch ($s) { case "a": return 1; case "c": return 2; } return 0; }', ['b']],
++    'catch'      => ['function () { try { throw new LogicException("x"); } catch (LogicException $e) { return "caught"; } catch (Exception $e) { return "generic"; } }',
++                     'function () { try { throw new LogicException("x"); } catch (RuntimeException $e) { return "caught"; } catch (Exception $e) { return "generic"; } }', []],
++    /* same opcodes, different metadata (variable names, types, initial
++     * values of static variables): shared, metadata stays per function */
++    'static'     => ['function () { static $n = 0; return ++$n; }', 'function () { static $n = 100; return ++$n; }', []],
++    'var_name'   => ['fn ($a) => $a * 3', 'fn ($b) => $b * 3', [7]],
++    'param_type' => ['function (int $x) { return gettype($x); }', 'function (string $x) { return gettype($x); }', ['42']],
++    'return_type'=> ['function ($x): int { return $x; }', 'function ($x): string { return $x; }', ['5']],
++    'identical'  => ['fn ($a) => $a * 2', 'fn ($a) => $a * 2', [21]],
++    /* last, as it shifts the lines that follow: different line, not shared */
++    'line'       => ['fn () => __LINE__', "\n" . 'fn () => __LINE__', []],
++];
++
++$sources = ['a' => "<?php\nreturn [\n", 'b' => "<?php\nreturn [\n"];
++foreach ($variants as $name => [$a, $b]) {
++    $sources['a'] .= "'$name' => $a,\n";
++    $sources['b'] .= "'$name' => $b,\n";
++}
++$paths = [];
++foreach ($sources as $root => $code) {
++    $paths[$root] = dedup_make_sites('dedup_variants', $code . "];\n", [$root])[$root];
++}
++
++$a = include $paths['a'];
++$before = dedup_stats()['hits'];
++$b = include $paths['b'];
++$shared = dedup_stats()['hits'] - $before;
++
++foreach ($variants as $name => [, , $args]) {
++    printf("%-11s a=%s b=%s\n", $name,
++        var_export($a[$name](...$args), true), var_export($b[$name](...$args), true));
++}
++echo "shared by docroot b: $shared\n";
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_variants');
++?>
++--EXPECT--
++operator    a=8 b=2
++comparison  a='ge' b='lt'
++int         a=10 b=11
++string      a='abc' b='abd'
++float       a=0.30000000000000004 b=0.4
++branches    a='yes' b='no'
++call        a='MIXED' b='mixed'
++arg_order   a='xy' b='yx'
++statement   a=8 b=9
++default     a=1 b=2
++array       a='{"x":1,"y":2}' b='{"y":2,"x":1}'
++match       a='two' b='deux'
++switch      a=2 b=0
++catch       a='caught' b='generic'
++static      a=1 b=101
++var_name    a=21 b=21
++param_type  a='integer' b='string'
++return_type a=5 b='5'
++identical   a=42 b=42
++line        a=22 b=23
++shared by docroot b: 5
+diff --git a/ext/opcache/tests/dedup/dedup_vendored.phpt b/ext/opcache/tests/dedup/dedup_vendored.phpt
+new file mode 100644
+index 00000000..b1f00f6e
+--- /dev/null
++++ b/ext/opcache/tests/dedup/dedup_vendored.phpt
+@@ -0,0 +1,77 @@
++--TEST--
++opcache.enable_dedup: identical methods of differently named classes are shared
++--EXTENSIONS--
++opcache
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.enable_dedup=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=0
++--FILE--
++<?php
++require __DIR__ . '/dedup.inc';
++
++/* Same library vendored under two prefixes, declared at compile time */
++$template = <<<'PHP'
++<?php
++namespace PREFIX\Lib;
++
++class Base
++{
++    protected array $items = [];
++
++    public function add(string $item): static
++    {
++        $this->items[] = \trim($item);
++        return $this;
++    }
++
++    public function count(): int
++    {
++        return \count($this->items);
++    }
++}
++
++class Collection extends Base
++{
++    public function join(string $glue = ', '): string
++    {
++        return \implode($glue, $this->items);
++    }
++}
++PHP;
++
++$paths = [];
++foreach (['Acme', 'Other'] as $prefix) {
++    $paths[$prefix] = dedup_make_sites('dedup_vendored', str_replace('PREFIX', $prefix, $template), [$prefix])[$prefix];
++}
++
++$before = dedup_stats();
++include $paths['Acme'];
++$middle = dedup_stats();
++include $paths['Other'];
++$after = dedup_stats();
++
++var_dump($middle['hits'] === $before['hits']);
++/* add(), count() and join() */
++var_dump($after['hits'] - $middle['hits'] >= 3);
++
++foreach (['Acme\Lib\Collection', 'Other\Lib\Collection'] as $class) {
++    $c = (new $class)->add(' x ')->add('y');
++    echo $class, ': ', $c->join(), ' (', $c->count(), ")\n";
++    var_dump((new ReflectionMethod($class, 'count'))->getDeclaringClass()->getName());
++}
++?>
++--CLEAN--
++<?php
++require __DIR__ . '/dedup.inc';
++dedup_remove_sites('dedup_vendored');
++?>
++--EXPECT--
++bool(true)
++bool(true)
++Acme\Lib\Collection: x, y (2)
++string(13) "Acme\Lib\Base"
++Other\Lib\Collection: x, y (2)
++string(14) "Other\Lib\Base"
+diff --git a/ext/opcache/zend_accelerator_dedup.c b/ext/opcache/zend_accelerator_dedup.c
+new file mode 100644
+index 00000000..262d892e
+--- /dev/null
++++ b/ext/opcache/zend_accelerator_dedup.c
+@@ -0,0 +1,612 @@
++/*
++   +----------------------------------------------------------------------+
++   | Zend OPcache                                                         |
++   +----------------------------------------------------------------------+
++   | Copyright © The PHP Group and Contributors.                          |
++   +----------------------------------------------------------------------+
++   | This source file is subject to the Modified BSD License that is      |
++   | bundled with this package in the file LICENSE, and is available      |
++   | through the World Wide Web at <https://www.php.net/license/>.        |
++   |                                                                      |
++   | SPDX-License-Identifier: BSD-3-Clause                                |
++   +----------------------------------------------------------------------+
++*/
++
++/*
++ * Security notes (multi-tenant hosting: one FPM master, one pool and one
++ * Unix user per site). Each decision below answers a reviewed attack
++ * surface; the full review, with the tests that verify each point, is kept
++ * in docs/SECURITY.md of the patch's repository.
++ *
++ * 1. Sharing never relies on the key alone. zend_hash_func() is not
++ *    collision resistant, so a key match is always followed by a full
++ *    comparison of the two serialized blocks (zend_accel_dedup_entry_equals).
++ *    Two blocks share memory only if they are byte-for-byte the same
++ *    opcodes and literals, in which case they are interchangeable by
++ *    construction. A collision can therefore prevent a sharing, never
++ *    cause one.
++ * 2. The key is salted (table->salt, random bytes drawn when the SHM is
++ *    initialized). Without it, a tenant could prepare blocks that fill the
++ *    probe sequence of a key and keep other tenants' identical code from
++ *    being shared (a denial of the optimization, not of service).
++ * 3. The table is only consulted while a script is persisted, i.e. right
++ *    after the tenant compiled it from a file it could open. Lookups by
++ *    path, opcache.validate_permission and opcache.validate_root are
++ *    untouched, and nothing lets a request ask for a block by key.
++ * 4. Blocks are immutable and are never freed before a restart, which
++ *    clears the table together with the SHM (zend_accel_dedup_reset). A
++ *    tenant editing or invalidating its own file gets a new block; the
++ *    others keep executing the old one. No refcount is needed.
++ * 5. Everything that identifies a tenant stays per op_array: filename,
++ *    scope, variable names, arg_info, static variables, try/catch and
++ *    live ranges, runtime definition keys (which embed the path). Only
++ *    opcodes and literal zvals are shared, and every reference they make
++ *    outside the block is either compared (operands, jump offsets,
++ *    handlers) or resolved per op_array or per request (CVs, cache slots,
++ *    static variable offsets, closure indexes, self/parent).
++ * 6. Compiled code is tenant-controlled, so the serializer is bounded:
++ *    array literals nested deeper than ZEND_ACCEL_DEDUP_MAX_DEPTH make the
++ *    op_array ineligible instead of recursing, lookups and insertions
++ *    probe at most ZEND_ACCEL_DEDUP_MAX_PROBES slots, a full table only
++ *    stops registrations, and the persist pass never reads a compiled
++ *    block again (the calc pass records its decisions).
++ * 7. What this does not change: the SHM is mapped read-write in every
++ *    worker. A worker that runs native code can already rewrite any cached
++ *    script, with or without this feature; sharing only makes one block
++ *    serve several tenants. opcache.restrict_api is required in shared
++ *    hosting with or without it (opcache_get_status(true),
++ *    opcache_invalidate() and opcache_reset() are otherwise available to
++ *    every tenant), and the "dedup" counters it exposes are a side channel
++ *    it closes. Memory growth observable from outside (e.g. /proc/meminfo)
++ *    can still reveal that another tenant runs the same code, as with any
++ *    memory deduplication.
++ */
++
++#include "ZendAccelerator.h"
++#include "zend_API.h"
++#include "zend_accelerator_dedup.h"
++#include "zend_shared_alloc.h"
++#include "zend_smart_str.h"
++#include "zend_vm.h"
++
++#ifdef HAVE_JIT
++# include "jit/zend_jit.h"
++#endif
++#include "php_version.h"
++#if PHP_VERSION_ID >= 80200
++# include "ext/random/php_random.h"
++#else
++# include "ext/standard/php_random.h"
++#endif
++
++/* Bound on the number of slots inspected per lookup or insertion. Keeps the
++ * work done under the SHM lock constant even if many blocks share a hash. */
++#define ZEND_ACCEL_DEDUP_MAX_PROBES 16
++
++/* Nesting of array literals beyond which an op_array is not shared: the
++ * serialization recurses, and compiled code is tenant-controlled. */
++#define ZEND_ACCEL_DEDUP_MAX_DEPTH  32
++
++#define ZEND_ACCEL_DEDUP_MIN_SLOTS  1024
++#define ZEND_ACCEL_DEDUP_MAX_SLOTS  (1 << 20)
++
++struct _zend_accel_dedup_entry {
++	zend_ulong  hash;         /* 0 marks a free slot; a real key is mapped away from 0 */
++	zend_op    *opcodes;
++	zval       *literals;
++	uint32_t    last;
++	uint32_t    last_literal;
++};
++
++struct _zend_accel_dedup_table {
++	zend_ulong             salt;        /* random, so that key collisions cannot be prepared */
++	uint32_t               mask;
++	uint32_t               num_entries;
++	uint32_t               max_entries;
++	zend_ulong             hits;
++	zend_ulong             misses;
++	zend_ulong             saved_memory;
++	zend_accel_dedup_entry slots[1];
++};
++
++/* Normalized, position independent representation of an opline. */
++typedef struct _zend_accel_dedup_op {
++	const void *handler;
++	uint32_t    op1;
++	uint32_t    op2;
++	uint32_t    result;
++	uint32_t    extended_value;
++	uint32_t    lineno;
++	uint8_t     opcode;
++	uint8_t     op1_type;
++	uint8_t     op2_type;
++	uint8_t     result_type;
++} zend_accel_dedup_op;
++
++/* Per-process state of the script being persisted. The persist size computed
++ * by zend_accel_script_persist_calc() must match exactly what
++ * zend_accel_script_persist() writes, so the persist pass applies the
++ * decisions taken by the calc pass instead of looking blocks up again. Both
++ * passes run under the SHM write lock, and entries are never removed before a
++ * restart, so a block found by the calc pass is still there.
++ *
++ * decisions maps the compiled opcodes of each op_array considered by the calc
++ * pass to the shared entry to use (IS_PTR) or, when there is none, to the
++ * hash of the block (IS_LONG), so that it can be registered without being
++ * serialized again. */
++static struct {
++	bool       calc;
++	bool       calc_done;
++	bool       persist;
++	bool       has_decisions;
++	HashTable  decisions;
++	zval      *pending;     /* decision of the op_array being persisted */
++} dedup_ctx;
++
++#if ZEND_ACCEL_DEDUP_SUPPORTED
++
++static void zend_accel_dedup_append_string(smart_str *buf, zend_string *str)
++{
++	size_t len = ZSTR_LEN(str);
++
++	smart_str_appendl(buf, (const char *) &len, sizeof(len));
++	smart_str_appendl(buf, ZSTR_VAL(str), len);
++}
++
++static bool zend_accel_dedup_append_zval(smart_str *buf, zval *zv, uint32_t depth)
++{
++	smart_str_appendc(buf, (char) Z_TYPE_P(zv));
++
++	switch (Z_TYPE_P(zv)) {
++		case IS_UNDEF:
++		case IS_NULL:
++		case IS_FALSE:
++		case IS_TRUE:
++			return true;
++		case IS_LONG:
++			smart_str_appendl(buf, (const char *) &Z_LVAL_P(zv), sizeof(zend_long));
++			return true;
++		case IS_DOUBLE:
++			/* Bitwise, so that 0.0 and -0.0 are kept apart. */
++			smart_str_appendl(buf, (const char *) &Z_DVAL_P(zv), sizeof(double));
++			return true;
++		case IS_STRING:
++			zend_accel_dedup_append_string(buf, Z_STR_P(zv));
++			return true;
++		case IS_ARRAY: {
++			HashTable *ht = Z_ARRVAL_P(zv);
++			uint32_t num_elements = zend_hash_num_elements(ht);
++			zend_ulong index;
++			zend_string *key;
++			zval *val;
++
++			if (depth >= ZEND_ACCEL_DEDUP_MAX_DEPTH) {
++				return false;
++			}
++			smart_str_appendl(buf, (const char *) &num_elements, sizeof(num_elements));
++			ZEND_HASH_FOREACH_KEY_VAL(ht, index, key, val) {
++				if (key) {
++					smart_str_appendc(buf, 's');
++					zend_accel_dedup_append_string(buf, key);
++				} else {
++					smart_str_appendc(buf, 'i');
++					smart_str_appendl(buf, (const char *) &index, sizeof(index));
++				}
++				if (!zend_accel_dedup_append_zval(buf, val, depth + 1)) {
++					return false;
++				}
++			} ZEND_HASH_FOREACH_END();
++			return true;
++		}
++		default:
++			/* Constant expressions, attribute pointers, etc. are not
++			 * compared; the op_array is simply not shared. */
++			return false;
++	}
++}
++
++static zend_always_inline uint32_t zend_accel_dedup_operand(const zend_op *opline, znode_op node, uint8_t type, uint32_t flags, const zval *literals)
++{
++	if (type == IS_CONST) {
++		/* Opline-relative offset to literal index */
++		return (uint32_t) (RT_CONSTANT(opline, node) - literals);
++	}
++	if (type == IS_UNUSED) {
++		switch (flags & ZEND_VM_OP_MASK) {
++			case 0:
++			case ZEND_VM_OP_THIS:
++			case ZEND_VM_OP_NEXT:
++				/* Not read by the VM, and possibly left uninitialized by
++				 * the compiler. */
++				return 0;
++		}
++	}
++	/* Everything else (CV/TMP/VAR offsets, jump offsets, numbers) is
++	 * already independent of the block's address. */
++	return node.num;
++}
++
++/* Serializes opcodes and literals into a representation that is identical
++ * for the compiled block and for its persisted copy, and that determines
++ * execution completely: two blocks with the same representation are
++ * interchangeable.
++ *
++ * Compiled blocks are only serialized by the calc pass, which frees nothing.
++ * The persist pass releases compiled values as it copies them (possibly
++ * values shared by several op_arrays), so it must never read a compiled
++ * block: it only serializes blocks that are already in SHM. */
++static bool zend_accel_dedup_normalize(smart_str *buf, const zend_op *opcodes, uint32_t last, zval *literals, uint32_t last_literal)
++{
++	const zend_op *opline = opcodes;
++	const zend_op *end = opcodes + last;
++	uint32_t i;
++
++	smart_str_appendl(buf, (const char *) &ZCSG(dedup)->salt, sizeof(zend_ulong));
++	smart_str_appendl(buf, (const char *) &last, sizeof(last));
++	smart_str_appendl(buf, (const char *) &last_literal, sizeof(last_literal));
++
++	for (; opline < end; opline++) {
++		uint32_t flags = zend_get_opcode_flags(opline->opcode);
++		zend_accel_dedup_op op;
++
++		memset(&op, 0, sizeof(op));
++		op.handler = opline->handler;
++		op.op1 = zend_accel_dedup_operand(opline, opline->op1, opline->op1_type, ZEND_VM_OP1_FLAGS(flags), literals);
++		op.op2 = zend_accel_dedup_operand(opline, opline->op2, opline->op2_type, ZEND_VM_OP2_FLAGS(flags), literals);
++		op.result = opline->result.num;
++		op.extended_value = opline->extended_value;
++		op.lineno = opline->lineno;
++		op.opcode = opline->opcode;
++		op.op1_type = opline->op1_type;
++		op.op2_type = opline->op2_type;
++		op.result_type = opline->result_type;
++
++		if (opline->op1_type == IS_CONST
++		 && (opline->opcode == ZEND_SEND_VAL
++		  || opline->opcode == ZEND_SEND_VAL_EX
++		  || opline->opcode == ZEND_QM_ASSIGN)) {
++			/* zend_persist_op_array_ex() re-selects these handlers, purely
++			 * from the fields compared above. */
++			op.handler = NULL;
++		}
++
++		smart_str_appendl(buf, (const char *) &op, sizeof(op));
++	}
++
++	for (i = 0; i < last_literal; i++) {
++		uint32_t extra = Z_EXTRA(literals[i]);
++
++		smart_str_appendl(buf, (const char *) &extra, sizeof(extra));
++		if (!zend_accel_dedup_append_zval(buf, &literals[i], 0)) {
++			return false;
++		}
++	}
++
++	smart_str_0(buf);
++	return true;
++}
++
++static bool zend_accel_dedup_entry_equals(const zend_accel_dedup_entry *entry, const smart_str *buf)
++{
++	smart_str other = {0};
++	bool equals;
++
++	equals = zend_accel_dedup_normalize(&other, entry->opcodes, entry->last, entry->literals, entry->last_literal)
++		&& ZSTR_LEN(other.s) == ZSTR_LEN(buf->s)
++		&& memcmp(ZSTR_VAL(other.s), ZSTR_VAL(buf->s), ZSTR_LEN(buf->s)) == 0;
++	smart_str_free(&other);
++
++	return equals;
++}
++
++/* Returns the entry equal to buf, or NULL */
++static zend_accel_dedup_entry *zend_accel_dedup_find(const smart_str *buf, zend_ulong hash)
++{
++	zend_accel_dedup_table *table = ZCSG(dedup);
++	uint32_t slot = (uint32_t) hash & table->mask;
++	uint32_t probes;
++
++	for (probes = 0; probes < ZEND_ACCEL_DEDUP_MAX_PROBES; probes++) {
++		zend_accel_dedup_entry *entry = &table->slots[slot];
++
++		if (!entry->hash) {
++			break;
++		}
++		if (entry->hash == hash && zend_accel_dedup_entry_equals(entry, buf)) {
++			return entry;
++		}
++		slot = (slot + 1) & table->mask;
++	}
++
++	return NULL;
++}
++
++static zend_always_inline bool zend_accel_dedup_eligible(const zend_op_array *op_array)
++{
++	return op_array->last > 0 && !zend_accel_in_shm(op_array->opcodes);
++}
++
++static zend_always_inline size_t zend_accel_dedup_block_size(const zend_op_array *op_array)
++{
++	/* Must match ADD_SIZE() in zend_persist_op_array_calc_ex() */
++	return ZEND_ALIGNED_SIZE(sizeof(zval) * op_array->last_literal)
++		+ ZEND_ALIGNED_SIZE(sizeof(zend_op) * op_array->last);
++}
++
++static zend_always_inline zend_ulong zend_accel_dedup_key(const zend_op_array *op_array)
++{
++	return (zend_ulong) (uintptr_t) op_array->opcodes;
++}
++
++static void zend_accel_dedup_forget_decisions(void)
++{
++	if (dedup_ctx.has_decisions) {
++		zend_hash_destroy(&dedup_ctx.decisions);
++		dedup_ctx.has_decisions = false;
++	}
++	dedup_ctx.pending = NULL;
++}
++
++#endif /* ZEND_ACCEL_DEDUP_SUPPORTED */
++
++void zend_accel_dedup_init_shm(void)
++{
++	ZCSG(dedup) = NULL;
++
++	if (!ZCG(accel_directives).enable_dedup) {
++		return;
++	}
++
++#if !ZEND_ACCEL_DEDUP_SUPPORTED
++	zend_accel_error(ACCEL_LOG_WARNING, "opcache.enable_dedup is not supported on this platform");
++#else
++	zend_accel_dedup_table *table;
++	zend_ulong num_slots;
++
++	if (ZCG(accel_directives).file_cache) {
++		/* The file cache serializes scripts relative to their own memory
++		 * block and cannot represent pointers into other scripts. */
++		zend_accel_error(ACCEL_LOG_WARNING, "opcache.enable_dedup is ignored because opcache.file_cache is set, unset it to use deduplication");
++		return;
++	}
++# ifdef HAVE_JIT
++	if (JIT_G(enabled) && JIT_G(buffer_size)) {
++		/* The JIT patches opline handlers of the op_array it compiles. With
++		 * opcache.jit=off and a JIT buffer, it can still be turned on at run
++		 * time (opcache.jit is INI_ALL), so that is not enough. */
++		zend_accel_error(ACCEL_LOG_WARNING, "opcache.enable_dedup is ignored because the JIT is enabled, set opcache.jit=disable or opcache.jit_buffer_size=0");
++		return;
++	}
++# endif
++
++	/* Four slots per cacheable script; duplicates do not take a slot */
++	num_slots = ZEND_ACCEL_DEDUP_MIN_SLOTS;
++	while (num_slots < (zend_ulong) ZCG(accel_directives).max_accelerated_files * 4
++	 && num_slots < ZEND_ACCEL_DEDUP_MAX_SLOTS) {
++		num_slots <<= 1;
++	}
++
++	table = zend_shared_alloc(sizeof(zend_accel_dedup_table) + (num_slots - 1) * sizeof(zend_accel_dedup_entry));
++	if (!table) {
++		zend_accel_error(ACCEL_LOG_WARNING, "Insufficient shared memory for opcache.enable_dedup, deduplication disabled");
++		return;
++	}
++	table->mask = (uint32_t) num_slots - 1;
++	table->max_entries = (uint32_t) (num_slots / 4 * 3);
++	/* zend_hash_func() is not collision resistant: without a secret salt, a
++	 * tenant could prepare blocks that fill the probe sequence of a key and
++	 * keep other tenants' blocks with that key from being shared. */
++	if (php_random_bytes(&table->salt, sizeof(table->salt), false) != SUCCESS) {
++		table->salt = (zend_ulong) (uintptr_t) table ^ (zend_ulong) time(NULL) ^ ((zend_ulong) getpid() << 32);
++	}
++	ZCSG(dedup) = table;
++	zend_accel_dedup_reset();
++#endif
++}
++
++void zend_accel_dedup_reset(void)
++{
++	zend_accel_dedup_table *table = ZCSG(dedup);
++
++	if (!table) {
++		return;
++	}
++
++	table->num_entries = 0;
++	table->hits = 0;
++	table->misses = 0;
++	table->saved_memory = 0;
++	memset(table->slots, 0, ((size_t) table->mask + 1) * sizeof(zend_accel_dedup_entry));
++}
++
++void zend_accel_dedup_calc_begin(bool for_shm)
++{
++#if ZEND_ACCEL_DEDUP_SUPPORTED
++	/* Left over if the previous script could not be persisted */
++	zend_accel_dedup_forget_decisions();
++
++	dedup_ctx.calc = for_shm && ZCSG(dedup) != NULL;
++	dedup_ctx.calc_done = false;
++	dedup_ctx.persist = false;
++	if (dedup_ctx.calc) {
++		/* Persistent, so that a script that is never persisted (out of
++		 * memory) does not show up as a request leak */
++		zend_hash_init(&dedup_ctx.decisions, 64, NULL, NULL, 1);
++		dedup_ctx.has_decisions = true;
++	}
++#endif
++}
++
++void zend_accel_dedup_calc_end(void)
++{
++	dedup_ctx.calc_done = dedup_ctx.calc;
++	dedup_ctx.calc = false;
++}
++
++/* Returns true when the opcodes and literals of op_array will be shared, in
++ * which case the caller must not account for the opcodes and the literal
++ * zvals. The literal values are still persisted, see zend_accel_dedup_share(). */
++bool zend_accel_dedup_calc_op_array(const zend_op_array *op_array)
++{
++#if ZEND_ACCEL_DEDUP_SUPPORTED
++	zend_accel_dedup_entry *entry = NULL;
++	smart_str buf = {0};
++	zval decision;
++
++	if (!dedup_ctx.calc || !zend_accel_dedup_eligible(op_array)) {
++		return false;
++	}
++
++	/* Sized for the opcodes; literals are usually smaller */
++	smart_str_alloc(&buf, op_array->last * sizeof(zend_accel_dedup_op) + 64, 0);
++	if (zend_accel_dedup_normalize(&buf, op_array->opcodes, op_array->last, op_array->literals, op_array->last_literal)) {
++		zend_ulong hash = zend_hash_func(ZSTR_VAL(buf.s), ZSTR_LEN(buf.s));
++
++		/* hash == 0 marks a free slot; map it away so a real block is never
++		 * mistaken for one (would only lose a sharing, never cause one) */
++		if (UNEXPECTED(hash == 0)) {
++			hash = 1;
++		}
++
++		entry = zend_accel_dedup_find(&buf, hash);
++		if (entry) {
++			ZVAL_PTR(&decision, entry);
++		} else {
++			ZVAL_LONG(&decision, (zend_long) hash);
++		}
++		zend_hash_index_update(&dedup_ctx.decisions, zend_accel_dedup_key(op_array), &decision);
++	}
++	smart_str_free(&buf);
++
++	return entry != NULL;
++#else
++	return false;
++#endif
++}
++
++void zend_accel_dedup_persist_begin(bool for_shm)
++{
++	/* Only valid right after the matching calc pass */
++	dedup_ctx.persist = for_shm && dedup_ctx.calc_done;
++	dedup_ctx.calc_done = false;
++}
++
++void zend_accel_dedup_persist_end(void)
++{
++#if ZEND_ACCEL_DEDUP_SUPPORTED
++	zend_accel_dedup_forget_decisions();
++#endif
++	dedup_ctx.persist = false;
++}
++
++/* Called by zend_persist_op_array_ex() before the literals and opcodes are
++ * copied. Returns the shared block to use instead, if any. */
++zend_accel_dedup_entry *zend_accel_dedup_persist_find(const zend_op_array *op_array)
++{
++#if ZEND_ACCEL_DEDUP_SUPPORTED
++	dedup_ctx.pending = NULL;
++	if (dedup_ctx.persist) {
++		dedup_ctx.pending = zend_hash_index_find(&dedup_ctx.decisions, zend_accel_dedup_key(op_array));
++		if (dedup_ctx.pending && Z_TYPE_P(dedup_ctx.pending) == IS_PTR) {
++			return Z_PTR_P(dedup_ctx.pending);
++		}
++	}
++#endif
++	return NULL;
++}
++
++/* Points op_array to the shared block and releases its compiled opcodes.
++ * The values of its literals must have been persisted in place beforehand
++ * (zend_persist_zval()), so that the compiled ones are released, or shared
++ * with other op_arrays of the script, exactly as usual. */
++void zend_accel_dedup_share(zend_op_array *op_array, const zend_accel_dedup_entry *entry)
++{
++#if ZEND_ACCEL_DEDUP_SUPPORTED
++	/* Methods sharing this op_array (e.g. inherited within the script) are
++	 * resolved through the xlat table, see zend_persist_op_array_ex(). */
++	if (op_array->literals) {
++		zend_shared_alloc_register_xlat_entry(op_array->literals, entry->literals);
++	}
++	zend_shared_alloc_register_xlat_entry(op_array->opcodes, entry->opcodes);
++
++	/* Literals are allocated together with the opcodes by pass_two() */
++	efree(op_array->opcodes);
++	op_array->opcodes = entry->opcodes;
++	op_array->literals = entry->literals;
++
++	ZCSG(dedup)->hits++;
++	ZCSG(dedup)->saved_memory += zend_accel_dedup_block_size(op_array);
++#endif
++}
++
++/* Called by zend_persist_op_array_ex() once the literals and opcodes of
++ * op_array have been copied to SHM, to make them available for sharing. */
++void zend_accel_dedup_register_op_array(const zend_op_array *op_array)
++{
++#if ZEND_ACCEL_DEDUP_SUPPORTED
++	zend_accel_dedup_table *table = ZCSG(dedup);
++	zval *decision = dedup_ctx.pending;
++	smart_str buf = {0};
++	zend_ulong hash;
++	uint32_t slot, probes;
++
++	dedup_ctx.pending = NULL;
++	if (!decision || Z_TYPE_P(decision) != IS_LONG) {
++		return;
++	}
++
++	table->misses++;
++	if (table->num_entries >= table->max_entries) {
++		return;
++	}
++
++	/* The calc pass hashed the compiled block, which serializes exactly
++	 * like this persisted copy */
++	hash = (zend_ulong) Z_LVAL_P(decision);
++	slot = (uint32_t) hash & table->mask;
++
++	for (probes = 0; probes < ZEND_ACCEL_DEDUP_MAX_PROBES; probes++) {
++		zend_accel_dedup_entry *entry = &table->slots[slot];
++
++		if (!entry->hash) {
++			entry->hash = hash;
++			entry->opcodes = op_array->opcodes;
++			entry->literals = op_array->literals;
++			entry->last = op_array->last;
++			entry->last_literal = op_array->last_literal;
++			table->num_entries++;
++			break;
++		}
++		if (entry->hash == hash) {
++			/* Possibly the same block twice in one script: only then is
++			 * this copy serialized again */
++			if (!buf.s) {
++				zend_accel_dedup_normalize(&buf, op_array->opcodes, op_array->last, op_array->literals, op_array->last_literal);
++			}
++			if (buf.s && zend_accel_dedup_entry_equals(entry, &buf)) {
++				break;
++			}
++		}
++		slot = (slot + 1) & table->mask;
++	}
++
++	smart_str_free(&buf);
++#endif
++}
++
++void zend_accel_dedup_add_status(zval *status)
++{
++	zend_accel_dedup_table *table = ZCSG(dedup);
++	zval dedup;
++
++	array_init(&dedup);
++	add_assoc_bool(&dedup, "enabled", table != NULL);
++	if (table) {
++		add_assoc_long(&dedup, "max_entries", table->max_entries);
++		add_assoc_long(&dedup, "num_entries", table->num_entries);
++		add_assoc_long(&dedup, "hits", table->hits);
++		add_assoc_long(&dedup, "misses", table->misses);
++		add_assoc_long(&dedup, "saved_memory", table->saved_memory);
++	}
++	add_assoc_zval(status, "dedup", &dedup);
++}
+diff --git a/ext/opcache/zend_accelerator_dedup.h b/ext/opcache/zend_accelerator_dedup.h
+new file mode 100644
+index 00000000..1848a1b5
+--- /dev/null
++++ b/ext/opcache/zend_accelerator_dedup.h
+@@ -0,0 +1,83 @@
++/*
++   +----------------------------------------------------------------------+
++   | Zend OPcache                                                         |
++   +----------------------------------------------------------------------+
++   | Copyright © The PHP Group and Contributors.                          |
++   +----------------------------------------------------------------------+
++   | This source file is subject to the Modified BSD License that is      |
++   | bundled with this package in the file LICENSE, and is available      |
++   | through the World Wide Web at <https://www.php.net/license/>.        |
++   |                                                                      |
++   | SPDX-License-Identifier: BSD-3-Clause                                |
++   +----------------------------------------------------------------------+
++*/
++
++#ifndef ZEND_ACCELERATOR_DEDUP_H
++#define ZEND_ACCELERATOR_DEDUP_H
++
++#include "zend.h"
++#include "zend_compile.h"
++
++/*
++ * Content-addressed sharing of opcode arrays in shared memory.
++ *
++ * Identical files cached under different paths (e.g. many copies of the same
++ * CMS on a shared host) compile to identical opcodes for most of their
++ * functions. When opcache.enable_dedup is on, the opcodes and literals of an
++ * op_array are not copied into SHM if a byte-for-byte equivalent block has
++ * already been persisted; the new op_array points to the existing block.
++ *
++ * Only the opcodes and literals are shared. Every op_array keeps its own
++ * filename, scope, variable names, arg_info, live ranges and try/catch
++ * table, so __FILE__, __DIR__, stack traces and error messages are not
++ * affected: path-dependent literals (__FILE__, __DIR__, runtime definition
++ * keys) simply make the block differ and prevent sharing.
++ *
++ * Lookups happen at persist time only, under the SHM write lock. Scripts are
++ * still looked up by path, so the existing permission checks
++ * (opcache.validate_permission, opcache.validate_root) are unchanged and a
++ * shared block can never be reached through its hash.
++ *
++ * Sharing requires opline-relative constant and jump operands, so it is
++ * only available on 64-bit builds.
++ *
++ * What makes a function path-dependent, and thus not shared:
++ * - __FILE__ and __DIR__, which are folded into literals at compile time,
++ *   including in default parameter values (RECV_INIT);
++ * - self::CONST when the class constant is built from __DIR__ or __FILE__,
++ *   because the optimizer inlines its value into the method.
++ * User constants are not: OPcache compiles with
++ * ZEND_COMPILE_NO_CONSTANT_SUBSTITUTION, so `const ROOT = __DIR__ . '/x';`
++ * or define() only make the file body that declares them path-dependent,
++ * and every function using ROOT fetches it by name at run time. Magic
++ * constants that do not depend on the path (__LINE__, __CLASS__,
++ * __FUNCTION__, __METHOD__, __NAMESPACE__) are identical in identical files.
++ * On a WordPress site with common plugins, path-dependent code is about 6.5%
++ * of the opcodes and literals, mostly file bodies (require __DIR__ . '...')
++ * and runtime definition keys of delayed class declarations.
++ */
++#if !ZEND_USE_ABS_CONST_ADDR && !ZEND_USE_ABS_JMP_ADDR
++# define ZEND_ACCEL_DEDUP_SUPPORTED 1
++#else
++# define ZEND_ACCEL_DEDUP_SUPPORTED 0
++#endif
++
++typedef struct _zend_accel_dedup_entry zend_accel_dedup_entry;
++typedef struct _zend_accel_dedup_table zend_accel_dedup_table;
++
++void zend_accel_dedup_init_shm(void);
++void zend_accel_dedup_reset(void);
++
++void zend_accel_dedup_calc_begin(bool for_shm);
++void zend_accel_dedup_calc_end(void);
++bool zend_accel_dedup_calc_op_array(const zend_op_array *op_array);
++
++void zend_accel_dedup_persist_begin(bool for_shm);
++void zend_accel_dedup_persist_end(void);
++zend_accel_dedup_entry *zend_accel_dedup_persist_find(const zend_op_array *op_array);
++void zend_accel_dedup_share(zend_op_array *op_array, const zend_accel_dedup_entry *entry);
++void zend_accel_dedup_register_op_array(const zend_op_array *op_array);
++
++void zend_accel_dedup_add_status(zval *status);
++
++#endif /* ZEND_ACCELERATOR_DEDUP_H */
+diff --git a/ext/opcache/zend_accelerator_module.c b/ext/opcache/zend_accelerator_module.c
+index d3921663..39bd4185 100644
+--- a/ext/opcache/zend_accelerator_module.c
++++ b/ext/opcache/zend_accelerator_module.c
+@@ -291,6 +291,7 @@ ZEND_INI_BEGIN()
+ 	STD_PHP_INI_ENTRY("opcache.opt_debug_level"       , "0"      , PHP_INI_SYSTEM, OnUpdateLong,             accel_directives.opt_debug_level,            zend_accel_globals, accel_globals)
+ 	STD_PHP_INI_BOOLEAN("opcache.enable_file_override"	, "0"   , PHP_INI_SYSTEM, OnUpdateBool,              accel_directives.file_override_enabled,     zend_accel_globals, accel_globals)
+ 	STD_PHP_INI_BOOLEAN("opcache.enable_cli"             , "0"   , PHP_INI_SYSTEM, OnUpdateBool,              accel_directives.enable_cli,                zend_accel_globals, accel_globals)
++	STD_PHP_INI_BOOLEAN("opcache.enable_dedup"           , "0"   , PHP_INI_SYSTEM, OnUpdateBool,              accel_directives.enable_dedup,              zend_accel_globals, accel_globals)
+ 	STD_PHP_INI_ENTRY("opcache.error_log"                , ""    , PHP_INI_SYSTEM, OnUpdateString,	         accel_directives.error_log,                 zend_accel_globals, accel_globals)
+ 	STD_PHP_INI_ENTRY("opcache.restrict_api"             , ""    , PHP_INI_SYSTEM, OnUpdateString,	         accel_directives.restrict_api,              zend_accel_globals, accel_globals)
+ 
+@@ -655,6 +656,8 @@ ZEND_FUNCTION(opcache_get_status)
+ 		add_assoc_zval(return_value, "interned_strings_usage", &interned_strings_usage);
+ 	}
+ 
++	zend_accel_dedup_add_status(return_value);
++
+ 	/* Accelerator statistics */
+ 	array_init(&statistics);
+ 	add_assoc_long(&statistics, "num_cached_scripts", ZCSG(hash).num_direct_entries);
+@@ -752,6 +755,7 @@ ZEND_FUNCTION(opcache_get_configuration)
+ 	array_init(&directives);
+ 	add_assoc_bool(&directives, "opcache.enable",              ZCG(enabled));
+ 	add_assoc_bool(&directives, "opcache.enable_cli",          ZCG(accel_directives).enable_cli);
++	add_assoc_bool(&directives, "opcache.enable_dedup",        ZCG(accel_directives).enable_dedup);
+ 	add_assoc_bool(&directives, "opcache.use_cwd",             ZCG(accel_directives).use_cwd);
+ 	add_assoc_bool(&directives, "opcache.validate_timestamps", ZCG(accel_directives).validate_timestamps);
+ 	add_assoc_bool(&directives, "opcache.validate_permission", ZCG(accel_directives).validate_permission);
+diff --git a/ext/opcache/zend_persist.c b/ext/opcache/zend_persist.c
+index 8272e10b..b638d208 100644
+--- a/ext/opcache/zend_persist.c
++++ b/ext/opcache/zend_persist.c
+@@ -501,7 +501,23 @@ static void zend_persist_op_array_ex(zend_op_array *op_array, zend_persistent_sc
+ 		GC_TYPE_INFO(op_array->static_variables) = GC_ARRAY | ((IS_ARRAY_IMMUTABLE|GC_NOT_COLLECTABLE) << GC_FLAGS_SHIFT);
+ 	}
+ 
+-	if (op_array->literals) {
++	zend_accel_dedup_entry *dedup_entry = zend_accel_dedup_persist_find(op_array);
++
++	if (dedup_entry) {
++		zval *p = op_array->literals;
++		zval *end = p + op_array->last_literal;
++
++		/* Only the literal zvals and the opcodes are shared. The values are
++		 * persisted as usual, so that they are released, or shared with other
++		 * op_arrays of the script through the xlat table. */
++		while (p < end) {
++			zend_persist_zval(p);
++			p++;
++		}
++		zend_accel_dedup_share(op_array, dedup_entry);
++	}
++
++	if (op_array->literals && !dedup_entry) {
+ 		zval *p, *end;
+ 
+ 		orig_literals = op_array->literals;
+@@ -518,7 +534,7 @@ static void zend_persist_op_array_ex(zend_op_array *op_array, zend_persistent_sc
+ 		}
+ 	}
+ 
+-	{
++	if (!dedup_entry) {
+ 		zend_op *new_opcodes = zend_shared_memdup_put(op_array->opcodes, sizeof(zend_op) * op_array->last);
+ 		zend_op *opline = new_opcodes;
+ 		zend_op *end = new_opcodes + op_array->last;
+@@ -598,6 +614,8 @@ static void zend_persist_op_array_ex(zend_op_array *op_array, zend_persistent_sc
+ 
+ 		efree(op_array->opcodes);
+ 		op_array->opcodes = new_opcodes;
++
++		zend_accel_dedup_register_op_array(op_array);
+ 	}
+ 
+ 	if (op_array->filename) {
+@@ -1315,6 +1333,7 @@ zend_persistent_script *zend_accel_script_persist(zend_persistent_script *script
+ 	Bucket *p;
+ 
+ 	script->mem = ZCG(mem);
++	zend_accel_dedup_persist_begin(for_shm);
+ 
+ 	ZEND_ASSERT(((zend_uintptr_t)ZCG(mem) & 0x7) == 0); /* should be 8 byte aligned */
+ 
+@@ -1383,5 +1402,7 @@ zend_persistent_script *zend_accel_script_persist(zend_persistent_script *script
+ 	script->corrupted = false;
+ 	ZCG(current_persistent_script) = NULL;
+ 
++	zend_accel_dedup_persist_end();
++
+ 	return script;
+ }
+diff --git a/ext/opcache/zend_persist_calc.c b/ext/opcache/zend_persist_calc.c
+index abe0a280..e885dbb1 100644
+--- a/ext/opcache/zend_persist_calc.c
++++ b/ext/opcache/zend_persist_calc.c
+@@ -241,10 +241,15 @@ static void zend_persist_op_array_calc_ex(zend_op_array *op_array)
+ 		}
+ 	}
+ 
++	bool dedup_shared = zend_accel_dedup_calc_op_array(op_array);
++
+ 	if (op_array->literals) {
+ 		zval *p = op_array->literals;
+ 		zval *end = p + op_array->last_literal;
+-		ADD_SIZE(sizeof(zval) * op_array->last_literal);
++		/* Literal values are persisted even when the zvals are shared */
++		if (!dedup_shared) {
++			ADD_SIZE(sizeof(zval) * op_array->last_literal);
++		}
+ 		while (p < end) {
+ 			zend_persist_zval_calc(p);
+ 			p++;
+@@ -252,7 +257,9 @@ static void zend_persist_op_array_calc_ex(zend_op_array *op_array)
+ 	}
+ 
+ 	zend_shared_alloc_register_xlat_entry(op_array->opcodes, op_array->opcodes);
+-	ADD_SIZE(sizeof(zend_op) * op_array->last);
++	if (!dedup_shared) {
++		ADD_SIZE(sizeof(zend_op) * op_array->last);
++	}
+ 
+ 	if (op_array->filename) {
+ 		ADD_STRING(op_array->filename);
+@@ -601,6 +608,7 @@ uint32_t zend_accel_script_persist_calc(zend_persistent_script *new_persistent_s
+ 	new_persistent_script->size = 0;
+ 	new_persistent_script->corrupted = false;
+ 	ZCG(current_persistent_script) = new_persistent_script;
++	zend_accel_dedup_calc_begin(for_shm);
+ 
+ 	if (!for_shm) {
+ 		/* script is not going to be saved in SHM */
+@@ -638,5 +646,7 @@ uint32_t zend_accel_script_persist_calc(zend_persistent_script *new_persistent_s
+ 
+ 	ZCG(current_persistent_script) = NULL;
+ 
++	zend_accel_dedup_calc_end();
++
+ 	return new_persistent_script->size;
+ }
+diff --git a/php.ini-development b/php.ini-development
+index 2bb47129..aa1ed59e 100644
+--- a/php.ini-development
++++ b/php.ini-development
+@@ -1786,6 +1786,13 @@ ldap.max_links = -1
+ ; Determines if Zend OPCache is enabled for the CLI version of PHP
+ ;opcache.enable_cli=0
+ 
++; Shares the opcodes of identical functions between cached scripts instead of
++; storing one copy per file path. Useful when many copies of the same code are
++; served by one PHP-FPM master. Ignored when the file cache is set or the JIT
++; is available (opcache.jit=off still allows enabling it at run time; use
++; opcache.jit=disable or opcache.jit_buffer_size=0).
++;opcache.enable_dedup=0
++
+ ; The OPcache shared memory storage size.
+ ;opcache.memory_consumption=128
+ 
+diff --git a/php.ini-production b/php.ini-production
+index 4fcd47bf..a808e6b1 100644
+--- a/php.ini-production
++++ b/php.ini-production
+@@ -1788,6 +1788,13 @@ ldap.max_links = -1
+ ; Determines if Zend OPCache is enabled for the CLI version of PHP
+ ;opcache.enable_cli=0
+ 
++; Shares the opcodes of identical functions between cached scripts instead of
++; storing one copy per file path. Useful when many copies of the same code are
++; served by one PHP-FPM master. Ignored when the file cache is set or the JIT
++; is available (opcache.jit=off still allows enabling it at run time; use
++; opcache.jit=disable or opcache.jit_buffer_size=0).
++;opcache.enable_dedup=0
++
+ ; The OPcache shared memory storage size.
+ ;opcache.memory_consumption=128
+ 
