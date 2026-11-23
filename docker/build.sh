@@ -19,6 +19,10 @@ if [ ! -d "$pristine/.git" ]; then
 	git -c advice.detachedHead=false clone -q --depth 1 --branch "$ref" https://github.com/php/php-src.git "$pristine"
 fi
 
+# A tree cloned from another ref (scripts/versions bumped) is rebuilt from scratch
+if [ -d "$tree/.git" ] && [ "$(git -C "$tree" remote get-url origin)" != "$pristine" ]; then
+	rm -rf "$tree"
+fi
 if [ ! -d "$tree/.git" ]; then
 	git clone -q "$pristine" "$tree"
 fi

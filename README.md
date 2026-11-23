@@ -13,7 +13,7 @@ The description intended for the php-src pull request is in
 > and therefore stores 80 copies of the same bytecode.
 
 The patch is written as a php-src PR targeting `master` (8.7-dev). Backports
-are provided for 8.2, 8.3, 8.4, 8.5 and 8.6 (RC3), the branches still
+are provided for 8.2, 8.3, 8.4, 8.5 and 8.6, the branches still
 maintained. 8.0 and 8.1, which are end-of-life, were dropped on 2026-10-20
 (the patch applied to them and passed the tests).
 

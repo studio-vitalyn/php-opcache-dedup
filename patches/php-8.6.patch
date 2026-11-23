@@ -1,6 +1,6 @@
-From dd55892a1d93cb624c02123d8a3901f5b26edfaa Mon Sep 17 00:00:00 2001
+From 1a56430bf8f439a27ea8a657b96091fa08fcb09e Mon Sep 17 00:00:00 2001
 From: Jean-Christophe CHENAILLER <jc@vitalyn.com>
-Date: Tue, 20 Oct 2026 12:35:21 +0000
+Date: Mon, 23 Nov 2026 08:44:44 +0000
 Subject: [PATCH] Opcache: share identical opcode arrays between cached scripts
 
 Shared hosts commonly serve many copies of the same application (CMS
@@ -84,10 +84,10 @@ opcache_get_status() exposes the counters in a new "dedup" key.
  create mode 100644 ext/opcache/zend_accelerator_dedup.h
 
 diff --git a/ext/opcache/ZendAccelerator.c b/ext/opcache/ZendAccelerator.c
-index da852f0c..c22afcc8 100644
+index 9330a85a..fea8f1f6 100644
 --- a/ext/opcache/ZendAccelerator.c
 +++ b/ext/opcache/ZendAccelerator.c
-@@ -2954,6 +2954,7 @@ ZEND_RINIT_FUNCTION(zend_accelerator)
+@@ -2981,6 +2981,7 @@ ZEND_RINIT_FUNCTION(zend_accelerator)
  				zend_map_ptr_reset();
  				zend_reset_cache_vars();
  				zend_accel_hash_clean(&ZCSG(hash));
@@ -95,7 +95,7 @@ index da852f0c..c22afcc8 100644
  
  				if (ZCSG(interned_strings).saved_top) {
  					accel_interned_strings_restore_state();
-@@ -3106,6 +3107,7 @@ static zend_result zend_accel_init_shm(void)
+@@ -3136,6 +3137,7 @@ static zend_result zend_accel_init_shm(void)
  	ZSMMG(app_shared_globals) = accel_shared_globals;
  
  	zend_accel_hash_init(&ZCSG(hash), ZCG(accel_directives).max_accelerated_files);
@@ -104,7 +104,7 @@ index da852f0c..c22afcc8 100644
  	if (ZCG(accel_directives).interned_strings_buffer) {
  		uint32_t hash_size;
 diff --git a/ext/opcache/ZendAccelerator.h b/ext/opcache/ZendAccelerator.h
-index 79208893..8b7f591e 100644
+index 5fd34441..33327718 100644
 --- a/ext/opcache/ZendAccelerator.h
 +++ b/ext/opcache/ZendAccelerator.h
 @@ -53,6 +53,7 @@
@@ -123,7 +123,7 @@ index 79208893..8b7f591e 100644
  	bool      validate_permission;
  #ifndef ZEND_WIN32
  	bool      validate_root;
-@@ -255,6 +257,7 @@ typedef struct _zend_accel_shared_globals {
+@@ -261,6 +263,7 @@ typedef struct _zend_accel_shared_globals {
  	zend_ulong   hash_restarts;    /* number of restarts because of hash overflow */
  	zend_ulong   manual_restarts;  /* number of restarts scheduled by opcache_reset() */
  	zend_accel_hash hash;             /* hash table for cached scripts */
@@ -1921,10 +1921,10 @@ index 00000000..1848a1b5
 +
 +#endif /* ZEND_ACCELERATOR_DEDUP_H */
 diff --git a/ext/opcache/zend_accelerator_module.c b/ext/opcache/zend_accelerator_module.c
-index a5136274..14b281bc 100644
+index aa8826e6..db6fa215 100644
 --- a/ext/opcache/zend_accelerator_module.c
 +++ b/ext/opcache/zend_accelerator_module.c
-@@ -319,6 +319,7 @@ ZEND_INI_BEGIN()
+@@ -324,6 +324,7 @@ ZEND_INI_BEGIN()
  	STD_PHP_INI_ENTRY("opcache.opt_debug_level"       , "0"      , PHP_INI_SYSTEM, OnUpdateLong,             accel_directives.opt_debug_level,            zend_accel_globals, accel_globals)
  	STD_PHP_INI_BOOLEAN("opcache.enable_file_override"	, "0"   , PHP_INI_SYSTEM, OnUpdateBool,              accel_directives.file_override_enabled,     zend_accel_globals, accel_globals)
  	STD_PHP_INI_BOOLEAN("opcache.enable_cli"             , "0"   , PHP_INI_SYSTEM, OnUpdateBool,              accel_directives.enable_cli,                zend_accel_globals, accel_globals)
@@ -1932,7 +1932,7 @@ index a5136274..14b281bc 100644
  	STD_PHP_INI_ENTRY("opcache.error_log"                , ""    , PHP_INI_SYSTEM, OnUpdateString,	         accel_directives.error_log,                 zend_accel_globals, accel_globals)
  	STD_PHP_INI_ENTRY("opcache.restrict_api"             , ""    , PHP_INI_SYSTEM, OnUpdateString,	         accel_directives.restrict_api,              zend_accel_globals, accel_globals)
  
-@@ -725,6 +726,8 @@ ZEND_FUNCTION(opcache_get_status)
+@@ -730,6 +731,8 @@ ZEND_FUNCTION(opcache_get_status)
  		add_assoc_zval(return_value, "interned_strings_usage", &interned_strings_usage);
  	}
  
@@ -1941,7 +1941,7 @@ index a5136274..14b281bc 100644
  	/* Accelerator statistics */
  	array_init(&statistics);
  	add_assoc_long(&statistics, "num_cached_scripts", ZCSG(hash).num_direct_entries);
-@@ -820,6 +823,7 @@ ZEND_FUNCTION(opcache_get_configuration)
+@@ -825,6 +828,7 @@ ZEND_FUNCTION(opcache_get_configuration)
  	array_init(&directives);
  	add_assoc_bool(&directives, "opcache.enable",              ZCG(enabled));
  	add_assoc_bool(&directives, "opcache.enable_cli",          ZCG(accel_directives).enable_cli);
@@ -1950,10 +1950,10 @@ index a5136274..14b281bc 100644
  	add_assoc_bool(&directives, "opcache.validate_timestamps", ZCG(accel_directives).validate_timestamps);
  	add_assoc_bool(&directives, "opcache.validate_permission", ZCG(accel_directives).validate_permission);
 diff --git a/ext/opcache/zend_persist.c b/ext/opcache/zend_persist.c
-index 13455178..db1a9c3e 100644
+index 052411a0..83ff8d08 100644
 --- a/ext/opcache/zend_persist.c
 +++ b/ext/opcache/zend_persist.c
-@@ -532,7 +532,23 @@ static void zend_persist_op_array_ex(zend_op_array *op_array, zend_persistent_sc
+@@ -580,7 +580,23 @@ static void zend_persist_op_array_ex(zend_op_array *op_array, zend_persistent_sc
  		GC_TYPE_INFO(op_array->static_variables) = GC_ARRAY | ((IS_ARRAY_IMMUTABLE|GC_NOT_COLLECTABLE) << GC_FLAGS_SHIFT);
  	}
  
@@ -1978,7 +1978,7 @@ index 13455178..db1a9c3e 100644
  		zval *p, *end;
  
  		orig_literals = op_array->literals;
-@@ -549,7 +565,7 @@ static void zend_persist_op_array_ex(zend_op_array *op_array, zend_persistent_sc
+@@ -597,7 +613,7 @@ static void zend_persist_op_array_ex(zend_op_array *op_array, zend_persistent_sc
  		}
  	}
  
@@ -1987,7 +1987,7 @@ index 13455178..db1a9c3e 100644
  		zend_op *new_opcodes = zend_shared_memdup_put(op_array->opcodes, sizeof(zend_op) * op_array->last);
  		zend_op *opline = new_opcodes;
  		zend_op *end = new_opcodes + op_array->last;
-@@ -642,6 +658,8 @@ static void zend_persist_op_array_ex(zend_op_array *op_array, zend_persistent_sc
+@@ -690,6 +706,8 @@ static void zend_persist_op_array_ex(zend_op_array *op_array, zend_persistent_sc
  
  		efree(op_array->opcodes);
  		op_array->opcodes = new_opcodes;
@@ -1996,7 +1996,7 @@ index 13455178..db1a9c3e 100644
  	}
  
  	if (op_array->filename) {
-@@ -1443,6 +1461,7 @@ zend_persistent_script *zend_accel_script_persist(zend_persistent_script *script
+@@ -1491,6 +1509,7 @@ zend_persistent_script *zend_accel_script_persist(zend_persistent_script *script
  	Bucket *p;
  
  	script->mem = ZCG(mem);
@@ -2004,7 +2004,7 @@ index 13455178..db1a9c3e 100644
  
  	ZEND_ASSERT(((uintptr_t)ZCG(mem) & 0x7) == 0); /* should be 8 byte aligned */
  
-@@ -1512,5 +1531,7 @@ zend_persistent_script *zend_accel_script_persist(zend_persistent_script *script
+@@ -1564,5 +1583,7 @@ zend_persistent_script *zend_accel_script_persist(zend_persistent_script *script
  	script->corrupted = false;
  	ZCG(current_persistent_script) = NULL;
  
